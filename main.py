@@ -20,7 +20,7 @@ from telegram.ext import (
 
 import db
 import llm
-from config import TELEGRAM_BOT_TOKEN, TIMEZONE
+from config import GROUP_CHAT_ID, TELEGRAM_BOT_TOKEN, TIMEZONE
 from utils import es_dia_laborable
 
 logging.basicConfig(
@@ -30,6 +30,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TIMEZONE)
+
+_ESTADOS_VALIDOS = {"pendiente", "en_curso", "bloqueada", "hecha"}
+_ICONOS_PRIORIDAD = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
+_ICONOS_ESTADO = {"pendiente": "⏳", "en_curso": "🔄", "bloqueada": "🚫", "hecha": "✅"}
+
+
+def _formatear_lista_tareas(tareas: list) -> str:
+    """Una línea por tarea. La BD ya las devuelve ordenadas por prioridad (alta→media→baja)."""
+    lineas = []
+    for t in tareas:
+        ip = _ICONOS_PRIORIDAD.get(t["prioridad"], "")
+        ie = _ICONOS_ESTADO.get(t["estado"], "")
+        lineas.append(f"{ip} [{t['id']}] {t['titulo']} — {t['estado']} {ie}")
+    return "\n".join(lineas)
 
 
 # ---------------------------------------------------------------------------
@@ -132,51 +146,132 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.warning("No se pudo reaccionar al mensaje: %s", exc)
 
 # ---------------------------------------------------------------------------
-# Jobs programados (stubs — implementar en fase siguiente)
+# Jobs programados
 # ---------------------------------------------------------------------------
 
 async def job_resumen_apertura(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Resumen de apertura — 8:30 lunes a viernes."""
     if not es_dia_laborable():
         return
-    # TODO: obtener tareas abiertas, construir resumen con LLM, enviar al grupo
-    logger.info("[JOB] Resumen de apertura (pendiente de implementar)")
+    if GROUP_CHAT_ID is None:
+        logger.warning("[JOB apertura] GROUP_CHAT_ID no configurado, resumen no enviado.")
+        return
+    try:
+        tareas = db.listar_tareas_abiertas()
+        if tareas:
+            texto = "☀️ Buenos días. Tareas abiertas hoy:\n\n" + _formatear_lista_tareas(tareas)
+        else:
+            texto = "☀️ Buenos días. No hay tareas abiertas ahora mismo."
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=texto)
+        logger.info("[JOB apertura] Resumen enviado (%d tareas).", len(tareas))
+    except Exception as exc:
+        logger.error("[JOB apertura] Error al enviar resumen: %s", exc)
 
 
 async def job_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Resumen de cierre — 17:00 lunes a viernes."""
     if not es_dia_laborable():
         return
-    # TODO: obtener tareas del día, construir resumen con LLM, enviar al grupo
-    logger.info("[JOB] Resumen de cierre (pendiente de implementar)")
+    if GROUP_CHAT_ID is None:
+        logger.warning("[JOB cierre] GROUP_CHAT_ID no configurado, resumen no enviado.")
+        return
+    try:
+        tareas = db.listar_tareas_abiertas()
+        if tareas:
+            cuerpo = _formatear_lista_tareas(tareas)
+            texto = (
+                "🌙 Cierre del día. Tareas que siguen abiertas:\n\n"
+                f"{cuerpo}\n\n"
+                "Revisad que esté todo correcto. Mañana más."
+            )
+        else:
+            texto = "🌙 Cierre del día. Todas las tareas están cerradas. ¡Buen trabajo!"
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=texto)
+        logger.info("[JOB cierre] Resumen enviado (%d tareas pendientes).", len(tareas))
+    except Exception as exc:
+        logger.error("[JOB cierre] Error al enviar resumen: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Comandos (stubs — implementar en fase siguiente)
+# Comandos
 # ---------------------------------------------------------------------------
 
 async def cmd_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lista las tareas abiertas."""
-    # TODO: db.listar_tareas_abiertas() → formatear y responder
-    await update.message.reply_text("(comando /tareas pendiente de implementar)")
+    """Lista las tareas abiertas ordenadas por prioridad."""
+    try:
+        tareas = db.listar_tareas_abiertas()
+        if not tareas:
+            await update.message.reply_text("No hay tareas abiertas.")
+            return
+        texto = "📋 Tareas abiertas:\n\n" + _formatear_lista_tareas(tareas)
+        await update.message.reply_text(texto)
+    except Exception as exc:
+        logger.error("Error en /tareas: %s", exc)
+        await update.message.reply_text("Error al obtener las tareas.")
 
 
 async def cmd_nueva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Crea una tarea nueva: /nueva <título>"""
-    # TODO: parsear args, db.crear_tarea(), confirmar
-    await update.message.reply_text("(comando /nueva pendiente de implementar)")
+    titulo = " ".join(context.args) if context.args else ""
+    if not titulo:
+        await update.message.reply_text("Uso: /nueva <título de la tarea>")
+        return
+    try:
+        autor = update.effective_user.username or update.effective_user.full_name or "desconocido"
+        tarea_id = db.crear_tarea(titulo=titulo, autor=autor, prioridad="media")
+        await update.message.reply_text(f"✅ Tarea #{tarea_id} creada: {titulo}")
+        logger.info("Tarea %d creada via /nueva por %s: '%s'", tarea_id, autor, titulo)
+    except Exception as exc:
+        logger.error("Error en /nueva: %s", exc)
+        await update.message.reply_text("Error al crear la tarea.")
 
 
 async def cmd_hecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Marca una tarea como hecha: /hecha <id>"""
-    # TODO: parsear id, db.actualizar_estado_tarea(id, 'hecha'), confirmar
-    await update.message.reply_text("(comando /hecha pendiente de implementar)")
+    raw = context.args[0] if context.args else ""
+    if not raw.isdigit():
+        await update.message.reply_text("Uso: /hecha <id>  (el id es un número entero)")
+        return
+    tarea_id = int(raw)
+    try:
+        tarea = db.obtener_tarea(tarea_id)
+        if tarea is None:
+            await update.message.reply_text(f"No existe la tarea #{tarea_id}.")
+            return
+        db.actualizar_estado_tarea(tarea_id, "hecha")
+        await update.message.reply_text(f"✅ Tarea #{tarea_id} marcada como hecha: {tarea['titulo']}")
+        logger.info("Tarea %d marcada como hecha via /hecha", tarea_id)
+    except Exception as exc:
+        logger.error("Error en /hecha: %s", exc)
+        await update.message.reply_text("Error al actualizar la tarea.")
 
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cambia el estado de una tarea: /estado <id> <nuevo_estado>"""
-    # TODO: parsear args, validar estado, db.actualizar_estado_tarea(), confirmar
-    await update.message.reply_text("(comando /estado pendiente de implementar)")
+    estados_str = ", ".join(sorted(_ESTADOS_VALIDOS))
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            f"Uso: /estado <id> <estado>\nEstados válidos: {estados_str}"
+        )
+        return
+    tarea_id = int(context.args[0])
+    nuevo_estado = context.args[1].lower()
+    if nuevo_estado not in _ESTADOS_VALIDOS:
+        await update.message.reply_text(
+            f"Estado '{nuevo_estado}' no válido.\nEstados válidos: {estados_str}"
+        )
+        return
+    try:
+        tarea = db.obtener_tarea(tarea_id)
+        if tarea is None:
+            await update.message.reply_text(f"No existe la tarea #{tarea_id}.")
+            return
+        db.actualizar_estado_tarea(tarea_id, nuevo_estado)
+        await update.message.reply_text(f"✅ Tarea #{tarea_id} actualizada a '{nuevo_estado}'.")
+        logger.info("Tarea %d → '%s' via /estado", tarea_id, nuevo_estado)
+    except Exception as exc:
+        logger.error("Error en /estado: %s", exc)
+        await update.message.reply_text("Error al actualizar la tarea.")
 
 
 # ---------------------------------------------------------------------------

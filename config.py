@@ -22,3 +22,11 @@ GEMINI_MODEL = "gemini-2.5-flash"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 TIMEZONE = "Europe/Madrid"
+
+# Chat ID del grupo donde el bot envía los resúmenes automáticos.
+# Telegram devuelve IDs negativos para grupos (ej: -1001234567890).
+# Si no está definido, los jobs de apertura/cierre loguean un warning y no fallan.
+_group_chat_id_raw = os.environ.get("GROUP_CHAT_ID", "")
+GROUP_CHAT_ID: int | None = (
+    int(_group_chat_id_raw) if _group_chat_id_raw.lstrip("-").isdigit() else None
+)
