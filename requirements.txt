@@ -1,0 +1,15 @@
+# Bot
+python-telegram-bot[job-queue]==21.9
+
+# Base de datos
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
+
+# LLM — Gemini (desarrollo)
+google-genai==1.16.0
+
+# LLM — Claude (producción)
+anthropic==0.52.0
+
+# Config
+python-dotenv==1.1.0
