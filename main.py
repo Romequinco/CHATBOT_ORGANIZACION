@@ -1,17 +1,15 @@
 """
 Bot de gestión de tareas para grupo de Telegram.
-
-Fase actual: captura y persiste todos los mensajes. Clasificación pendiente.
 """
 
 import logging
 from datetime import time
 from zoneinfo import ZoneInfo
 
-from telegram import Update
-from telegram import ReactionTypeEmoji
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -31,13 +29,17 @@ logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TIMEZONE)
 
+# por_verificar es estado gestionado por el bot; no lo exponemos en /estado
 _ESTADOS_VALIDOS = {"pendiente", "en_curso", "bloqueada", "hecha"}
 _ICONOS_PRIORIDAD = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
-_ICONOS_ESTADO = {"pendiente": "⏳", "en_curso": "🔄", "bloqueada": "🚫", "hecha": "✅"}
+_ICONOS_ESTADO = {
+    "pendiente": "⏳", "en_curso": "🔄", "bloqueada": "🚫",
+    "hecha": "✅", "por_verificar": "🔍",
+}
 
 
 def _formatear_lista_tareas(tareas: list) -> str:
-    """Una línea por tarea. La BD ya las devuelve ordenadas por prioridad (alta→media→baja)."""
+    """Una línea por tarea. La BD ya las devuelve ordenadas por prioridad."""
     lineas = []
     for t in tareas:
         ip = _ICONOS_PRIORIDAD.get(t["prioridad"], "")
@@ -46,8 +48,20 @@ def _formatear_lista_tareas(tareas: list) -> str:
     return "\n".join(lineas)
 
 
+def _teclado_verificacion(tareas: list) -> InlineKeyboardMarkup:
+    """Par de botones por tarea + 'Confirmar todo'."""
+    botones = []
+    for t in tareas:
+        botones.append([
+            InlineKeyboardButton(f"✅ Hecha [{t['id']}]", callback_data=f"verif:hecha:{t['id']}"),
+            InlineKeyboardButton(f"↩️ Sigue abierta [{t['id']}]", callback_data=f"verif:abierta:{t['id']}"),
+        ])
+    botones.append([InlineKeyboardButton("✅ Confirmar todo", callback_data="verif:confirmar_todo")])
+    return InlineKeyboardMarkup(botones)
+
+
 # ---------------------------------------------------------------------------
-# Comando /start
+# /start
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -58,7 +72,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Handler principal: todos los mensajes del grupo
+# Handler principal
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -68,23 +82,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat = update.effective_chat
     user = update.effective_user
-
     autor = user.username or user.full_name or str(user.id)
-    logger.info("Mensaje recibido | chat_id=%s | autor=%s | texto=%r", chat.id, autor, msg.text[:80])
 
-    # Imprime el chat_id en logs (útil para configurar los resúmenes automáticos)
+    logger.info("Mensaje recibido | chat_id=%s | autor=%s | texto=%r", chat.id, autor, msg.text[:80])
     print(f"[DEBUG] chat_id del grupo: {chat.id}")
 
-    # Clasificar con LLM antes de persistir
+    # --- MODO VERIFICACIÓN: capa adicional antes del flujo normal ---
+    try:
+        modo = db.obtener_modo_verificacion()
+    except Exception as exc:
+        logger.error("Error al consultar modo verificación: %s", exc)
+        modo = None
+
+    if modo is not None:
+        try:
+            tareas_pv = db.listar_tareas_por_verificar()
+            tareas_ab = db.listar_tareas_abiertas()
+            propuesta = llm.interpretar_correccion(msg.text, tareas_pv + tareas_ab)
+        except Exception as exc:
+            logger.error("Error en interpretar_correccion: %s", exc)
+            propuesta = {"correcciones": [], "interpretacion": "", "hay_cambios": False}
+
+        if propuesta.get("hay_cambios"):
+            try:
+                datos = modo["datos"]
+                datos["propuesta_pendiente"] = {
+                    "correcciones": propuesta["correcciones"],
+                    "interpretacion": propuesta["interpretacion"],
+                }
+                db.actualizar_datos_verificacion(datos)
+                teclado = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Sí, aplicar", callback_data="corr:si"),
+                    InlineKeyboardButton("❌ No", callback_data="corr:no"),
+                ]])
+                await msg.reply_text(
+                    f"Voy a aplicar: {propuesta['interpretacion']}",
+                    reply_markup=teclado,
+                )
+                db.insertar_mensaje_log(
+                    telegram_message_id=msg.message_id,
+                    chat_id=chat.id,
+                    autor=autor,
+                    texto=msg.text,
+                    clasificacion={"modo": "verificacion_correccion", "propuesta": propuesta},
+                )
+            except Exception as exc:
+                logger.error("Error al procesar corrección en modo verificación: %s", exc)
+            return  # No continuar al flujo normal
+
+        logger.info("Modo verificación activo pero mensaje no es corrección; procesando normalmente.")
+
+    # --- FLUJO NORMAL ---
     tareas_abiertas = db.listar_tareas_abiertas()
     clasificacion = llm.classify(msg.text, tareas_abiertas)
-    logger.info(
-        "Clasificado como '%s' | %s",
-        clasificacion["categoria"],
-        clasificacion["razonamiento"],
-    )
+    logger.info("Clasificado como '%s' | %s", clasificacion["categoria"], clasificacion["razonamiento"])
 
-    # Persistir en log de auditoría con clasificación incluida
     db.insertar_mensaje_log(
         telegram_message_id=msg.message_id,
         chat_id=chat.id,
@@ -93,7 +145,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         clasificacion=clasificacion,
     )
 
-    # Ejecutar acción según categoría
     categoria = clasificacion["categoria"]
     reaccionar = False
 
@@ -104,10 +155,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 autor=autor,
                 prioridad=clasificacion["prioridad"] or "media",
             )
-            logger.info(
-                "Tarea %d creada: '%s' (prioridad: %s)",
-                tarea_id, clasificacion["titulo"], clasificacion["prioridad"] or "media",
-            )
+            logger.info("Tarea %d creada: '%s' (prioridad: %s)",
+                        tarea_id, clasificacion["titulo"], clasificacion["prioridad"] or "media")
             reaccionar = True
         except Exception as exc:
             logger.error("Error al crear tarea: %s", exc)
@@ -116,11 +165,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         tid = clasificacion.get("tarea_id_relacionada")
         if tid is not None and db.obtener_tarea(tid) is not None:
             try:
-                db.actualizar_estado_tarea(tid, "hecha")
-                logger.info("Tarea %d marcada como hecha", tid)
+                db.actualizar_estado_tarea(tid, "por_verificar")
+                logger.info("Tarea %d marcada como por_verificar (pendiente de confirmación en el cierre)", tid)
                 reaccionar = True
             except Exception as exc:
-                logger.error("Error al marcar tarea %d como hecha: %s", tid, exc)
+                logger.error("Error al marcar tarea %d como por_verificar: %s", tid, exc)
         else:
             logger.info("completada sin tarea enlazada válida, ignorada")
 
@@ -145,6 +194,95 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as exc:
             logger.warning("No se pudo reaccionar al mensaje: %s", exc)
 
+
+# ---------------------------------------------------------------------------
+# Callbacks: verificación (verif:*) y correcciones (corr:*)
+# ---------------------------------------------------------------------------
+
+async def handle_verif_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botones del resumen de cierre: hecha, sigue abierta, confirmar todo."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    try:
+        if data.startswith("verif:hecha:"):
+            tarea_id = int(data.split(":")[2])
+            db.actualizar_estado_tarea(tarea_id, "hecha")
+            logger.info("[VERIF] Tarea %d → hecha via botón", tarea_id)
+            restantes = db.listar_tareas_por_verificar()
+            if restantes:
+                await query.edit_message_reply_markup(reply_markup=_teclado_verificacion(restantes))
+            else:
+                db.desactivar_modo_verificacion()
+                await query.edit_message_reply_markup(reply_markup=None)
+                if GROUP_CHAT_ID:
+                    await context.bot.send_message(GROUP_CHAT_ID, "✅ Todas las tareas verificadas. ¡Buen trabajo!")
+
+        elif data.startswith("verif:abierta:"):
+            tarea_id = int(data.split(":")[2])
+            db.actualizar_estado_tarea(tarea_id, "pendiente")
+            logger.info("[VERIF] Tarea %d → pendiente via botón", tarea_id)
+            restantes = db.listar_tareas_por_verificar()
+            if restantes:
+                await query.edit_message_reply_markup(reply_markup=_teclado_verificacion(restantes))
+            else:
+                db.desactivar_modo_verificacion()
+                await query.edit_message_reply_markup(reply_markup=None)
+
+        elif data == "verif:confirmar_todo":
+            tareas_pv = db.listar_tareas_por_verificar()
+            n = len(tareas_pv)
+            for t in tareas_pv:
+                db.actualizar_estado_tarea(t["id"], "hecha")
+            db.desactivar_modo_verificacion()
+            await query.edit_message_reply_markup(reply_markup=None)
+            if GROUP_CHAT_ID:
+                await context.bot.send_message(
+                    GROUP_CHAT_ID,
+                    f"✅ Verificación completa. {n} tarea(s) marcada(s) como hechas.",
+                )
+            logger.info("[VERIF] Confirmar todo: %d tarea(s) cerrada(s).", n)
+
+    except Exception as exc:
+        logger.error("Error en handle_verif_callback (%s): %s", data, exc)
+
+
+async def handle_corr_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botones de confirmación de correcciones textuales (corr:si / corr:no)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    try:
+        modo = db.obtener_modo_verificacion()
+        if modo is None:
+            await query.edit_message_text("⚠️ El modo verificación ya no está activo.")
+            return
+
+        datos = modo["datos"]
+        propuesta = datos.get("propuesta_pendiente")
+        if not propuesta:
+            await query.edit_message_text("⚠️ No hay corrección pendiente de confirmar.")
+            return
+
+        if data == "corr:si":
+            for c in propuesta.get("correcciones", []):
+                db.actualizar_estado_tarea(c["tarea_id"], c["nuevo_estado"])
+            logger.info("[VERIF] Corrección aplicada: %s", propuesta["interpretacion"])
+            datos["propuesta_pendiente"] = None
+            db.actualizar_datos_verificacion(datos)
+            await query.edit_message_text(f"✅ Aplicado: {propuesta['interpretacion']}")
+
+        elif data == "corr:no":
+            datos["propuesta_pendiente"] = None
+            db.actualizar_datos_verificacion(datos)
+            await query.edit_message_text("❌ Corrección descartada.")
+
+    except Exception as exc:
+        logger.error("Error en handle_corr_callback (%s): %s", data, exc)
+
+
 # ---------------------------------------------------------------------------
 # Jobs programados
 # ---------------------------------------------------------------------------
@@ -154,64 +292,97 @@ async def job_resumen_apertura(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not es_dia_laborable():
         return
     if GROUP_CHAT_ID is None:
-        logger.warning("[JOB apertura] GROUP_CHAT_ID no configurado, resumen no enviado.")
+        logger.warning("[JOB apertura] GROUP_CHAT_ID no configurado.")
         return
     try:
         tareas = db.listar_tareas_abiertas()
-        if tareas:
-            texto = "☀️ Buenos días. Tareas abiertas hoy:\n\n" + _formatear_lista_tareas(tareas)
-        else:
-            texto = "☀️ Buenos días. No hay tareas abiertas ahora mismo."
+        texto = (
+            "☀️ Buenos días. Tareas abiertas hoy:\n\n" + _formatear_lista_tareas(tareas)
+            if tareas else
+            "☀️ Buenos días. No hay tareas abiertas ahora mismo."
+        )
         await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=texto)
         logger.info("[JOB apertura] Resumen enviado (%d tareas).", len(tareas))
     except Exception as exc:
-        logger.error("[JOB apertura] Error al enviar resumen: %s", exc)
+        logger.error("[JOB apertura] Error: %s", exc)
 
 
 async def job_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Resumen de cierre — 17:00 lunes a viernes."""
+    """Resumen de cierre — 17:00. Activa modo verificación si hay tareas por_verificar."""
     if not es_dia_laborable():
         return
     if GROUP_CHAT_ID is None:
-        logger.warning("[JOB cierre] GROUP_CHAT_ID no configurado, resumen no enviado.")
+        logger.warning("[JOB cierre] GROUP_CHAT_ID no configurado.")
         return
     try:
-        tareas = db.listar_tareas_abiertas()
-        if tareas:
-            cuerpo = _formatear_lista_tareas(tareas)
-            texto = (
-                "🌙 Cierre del día. Tareas que siguen abiertas:\n\n"
-                f"{cuerpo}\n\n"
-                "Revisad que esté todo correcto. Mañana más."
-            )
+        tareas_ab = db.listar_tareas_abiertas()
+        tareas_pv = db.listar_tareas_por_verificar()
+
+        partes = ["🌙 Cierre del día."]
+        if tareas_ab:
+            partes.append("\n📋 Siguen abiertas:\n" + _formatear_lista_tareas(tareas_ab))
         else:
-            texto = "🌙 Cierre del día. Todas las tareas están cerradas. ¡Buen trabajo!"
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=texto)
-        logger.info("[JOB cierre] Resumen enviado (%d tareas pendientes).", len(tareas))
+            partes.append("\nNo hay tareas activamente abiertas.")
+        if tareas_pv:
+            partes.append("\n🔍 Pendientes de verificar:\n" + _formatear_lista_tareas(tareas_pv))
+
+        texto = "\n".join(partes)
+
+        if tareas_pv:
+            sent = await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID, text=texto, reply_markup=_teclado_verificacion(tareas_pv)
+            )
+            db.activar_modo_verificacion({
+                "tareas_ids": [t["id"] for t in tareas_pv],
+                "resumen_message_id": sent.message_id,
+                "propuesta_pendiente": None,
+            })
+            logger.info("[JOB cierre] Modo verificación activado con %d tarea(s).", len(tareas_pv))
+        else:
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID, text=texto + "\n\nTodas las tareas están en orden. Mañana más."
+            )
+            logger.info("[JOB cierre] Resumen enviado sin modo verificación.")
+
     except Exception as exc:
-        logger.error("[JOB cierre] Error al enviar resumen: %s", exc)
+        logger.error("[JOB cierre] Error: %s", exc)
+
+
+async def job_expiracion_verificacion(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """00:00 todos los días — revierte por_verificar a pendiente si el modo sigue activo."""
+    try:
+        if db.obtener_modo_verificacion() is None:
+            return
+        n = db.revertir_tareas_por_verificar()
+        db.desactivar_modo_verificacion()
+        logger.info("[JOB expiración] %d tarea(s) devuelta(s) a pendiente.", n)
+        if GROUP_CHAT_ID:
+            await context.bot.send_message(
+                GROUP_CHAT_ID,
+                f"⏰ Ventana de verificación cerrada. "
+                f"{n} tarea(s) no confirmada(s) vuelve(n) a pendiente.",
+            )
+    except Exception as exc:
+        logger.error("[JOB expiración] Error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
 # Comandos
 # ---------------------------------------------------------------------------
 
-async def cmd_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lista las tareas abiertas ordenadas por prioridad."""
+async def cmd_tareas(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         tareas = db.listar_tareas_abiertas()
         if not tareas:
             await update.message.reply_text("No hay tareas abiertas.")
             return
-        texto = "📋 Tareas abiertas:\n\n" + _formatear_lista_tareas(tareas)
-        await update.message.reply_text(texto)
+        await update.message.reply_text("📋 Tareas abiertas:\n\n" + _formatear_lista_tareas(tareas))
     except Exception as exc:
         logger.error("Error en /tareas: %s", exc)
         await update.message.reply_text("Error al obtener las tareas.")
 
 
 async def cmd_nueva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Crea una tarea nueva: /nueva <título>"""
     titulo = " ".join(context.args) if context.args else ""
     if not titulo:
         await update.message.reply_text("Uso: /nueva <título de la tarea>")
@@ -220,17 +391,16 @@ async def cmd_nueva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         autor = update.effective_user.username or update.effective_user.full_name or "desconocido"
         tarea_id = db.crear_tarea(titulo=titulo, autor=autor, prioridad="media")
         await update.message.reply_text(f"✅ Tarea #{tarea_id} creada: {titulo}")
-        logger.info("Tarea %d creada via /nueva por %s: '%s'", tarea_id, autor, titulo)
+        logger.info("Tarea %d creada via /nueva por %s", tarea_id, autor)
     except Exception as exc:
         logger.error("Error en /nueva: %s", exc)
         await update.message.reply_text("Error al crear la tarea.")
 
 
 async def cmd_hecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Marca una tarea como hecha: /hecha <id>"""
     raw = context.args[0] if context.args else ""
     if not raw.isdigit():
-        await update.message.reply_text("Uso: /hecha <id>  (el id es un número entero)")
+        await update.message.reply_text("Uso: /hecha <id>")
         return
     tarea_id = int(raw)
     try:
@@ -240,26 +410,21 @@ async def cmd_hecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         db.actualizar_estado_tarea(tarea_id, "hecha")
         await update.message.reply_text(f"✅ Tarea #{tarea_id} marcada como hecha: {tarea['titulo']}")
-        logger.info("Tarea %d marcada como hecha via /hecha", tarea_id)
+        logger.info("Tarea %d → hecha via /hecha", tarea_id)
     except Exception as exc:
         logger.error("Error en /hecha: %s", exc)
         await update.message.reply_text("Error al actualizar la tarea.")
 
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cambia el estado de una tarea: /estado <id> <nuevo_estado>"""
     estados_str = ", ".join(sorted(_ESTADOS_VALIDOS))
     if len(context.args) < 2 or not context.args[0].isdigit():
-        await update.message.reply_text(
-            f"Uso: /estado <id> <estado>\nEstados válidos: {estados_str}"
-        )
+        await update.message.reply_text(f"Uso: /estado <id> <estado>\nEstados válidos: {estados_str}")
         return
     tarea_id = int(context.args[0])
     nuevo_estado = context.args[1].lower()
     if nuevo_estado not in _ESTADOS_VALIDOS:
-        await update.message.reply_text(
-            f"Estado '{nuevo_estado}' no válido.\nEstados válidos: {estados_str}"
-        )
+        await update.message.reply_text(f"Estado '{nuevo_estado}' no válido.\nVálidos: {estados_str}")
         return
     try:
         tarea = db.obtener_tarea(tarea_id)
@@ -283,30 +448,21 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("tareas", cmd_tareas))
     app.add_handler(CommandHandler("nueva", cmd_nueva))
     app.add_handler(CommandHandler("hecha", cmd_hecha))
     app.add_handler(CommandHandler("estado", cmd_estado))
 
-    # Mensajes normales (no comandos)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Jobs diarios (lunes=0 … viernes=4)
+    app.add_handler(CallbackQueryHandler(handle_verif_callback, pattern="^verif:"))
+    app.add_handler(CallbackQueryHandler(handle_corr_callback, pattern="^corr:"))
+
     jq = app.job_queue
-    jq.run_daily(
-        job_resumen_apertura,
-        time=time(8, 30, tzinfo=TZ),
-        days=(0, 1, 2, 3, 4),
-        name="apertura",
-    )
-    jq.run_daily(
-        job_resumen_cierre,
-        time=time(17, 0, tzinfo=TZ),
-        days=(0, 1, 2, 3, 4),
-        name="cierre",
-    )
+    jq.run_daily(job_resumen_apertura, time=time(8, 30, tzinfo=TZ), days=(0, 1, 2, 3, 4), name="apertura")
+    jq.run_daily(job_resumen_cierre, time=time(17, 0, tzinfo=TZ), days=(0, 1, 2, 3, 4), name="cierre")
+    jq.run_daily(job_expiracion_verificacion, time=time(0, 0, tzinfo=TZ), name="expiracion_verificacion")
 
     logger.info("Bot arrancado con long-polling.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
