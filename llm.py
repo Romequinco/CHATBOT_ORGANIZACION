@@ -288,3 +288,50 @@ def interpretar_correccion(mensaje: str, tareas_en_verificacion: list) -> dict:
     except Exception as exc:
         logger.error("LLM agotó reintentos en interpretar_correccion (%s): %s", LLM_PROVIDER, exc)
         return _FALLBACK_CORRECCION.copy()
+
+
+# ---------------------------------------------------------------------------
+# TRANSCRIPCIÓN DE AUDIO — siempre vía Gemini, independiente de LLM_PROVIDER
+#
+# DEUDA TÉCNICA — privacidad/RGPD:
+# Hay DOS puntos de proceso LLM que requieren migración cuando se cambie de
+# proveedor por requisitos de privacidad/DPA:
+#   1. Clasificación de texto → ya en Claude (Anthropic). Migrar: LLM_PROVIDER.
+#   2. Transcripción de audio → aún en Gemini (Google, tier gratuito). Migrar: ESTA función.
+# No basta con cambiar LLM_PROVIDER: el audio seguiría yendo a Google.
+# Ver también el comentario en handle_audio (main.py) para el contexto completo.
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """
+    Transcribe audio a texto usando Gemini. Siempre usa GEMINI_API_KEY
+    independientemente de LLM_PROVIDER, para mantener Claude exclusivo de
+    clasificación. Devuelve "" si falla o si GEMINI_API_KEY no está configurada.
+    """
+    from google import genai
+    from google.genai import types
+
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY no configurada; transcripción de audio no disponible.")
+        return ""
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part(inline_data=types.Blob(data=audio_bytes, mime_type=mime_type)),
+                types.Part(text=(
+                    "Transcribe el audio a texto en español. "
+                    "Devuelve únicamente la transcripción, sin explicaciones ni formato adicional. "
+                    "Si el audio es inaudible o no contiene habla reconocible, devuelve una cadena vacía."
+                )),
+            ],
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        text = (response.text or "").strip()
+        logger.info("Transcripción Gemini (%s): %r", mime_type, text[:100])
+        return text
+    except Exception as exc:
+        logger.error("Error en transcribe_audio: %s", exc)
+        return ""

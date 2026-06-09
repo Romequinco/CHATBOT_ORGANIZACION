@@ -64,30 +64,35 @@ def _teclado_verificacion(tareas: list) -> InlineKeyboardMarkup:
 # /start
 # ---------------------------------------------------------------------------
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if GROUP_CHAT_ID and update.effective_chat.id != GROUP_CHAT_ID:
+        return
     await update.message.reply_text(
-        "Bot de tareas activo.\n"
-        "Estoy escuchando todos los mensajes del grupo y los registro en la base de datos."
+        "Bot de tareas activo en el grupo.\n\n"
+        "Qué hace: leo los mensajes y apunto automáticamente tareas, actualizaciones y problemas. "
+        "Si reacciono con 👍 es que lo he registrado; si no reacciono, no he apuntado nada "
+        "(lo he tomado como charla normal).\n\n"
+        "Resúmenes automáticos: 8:30 (tareas abiertas) y 17:00 (repaso + confirmación de lo terminado).\n\n"
+        "Privacidad: los mensajes se procesan con un modelo de IA (Claude / Anthropic) solo para "
+        "clasificarlos. Nada más.\n\n"
+        "Comandos: /tareas · /nueva · /hecha · /estado"
     )
 
 
 # ---------------------------------------------------------------------------
-# Handler principal
+# Pipeline compartido: clasificación + acciones + reacción 👍
+# Usado por handle_message (texto directo) y handle_audio (texto transcrito).
 # ---------------------------------------------------------------------------
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if msg is None or msg.text is None:
-        return
-
-    chat = update.effective_chat
-    user = update.effective_user
-    autor = user.username or user.full_name or str(user.id)
-
-    logger.info("Mensaje recibido | chat_id=%s | autor=%s | texto=%r", chat.id, autor, msg.text[:80])
-    print(f"[DEBUG] chat_id del grupo: {chat.id}")
-
-    # --- MODO VERIFICACIÓN: capa adicional antes del flujo normal ---
+async def _run_pipeline(
+    texto: str,
+    origen: str,
+    msg,
+    chat,
+    autor: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    # --- MODO VERIFICACIÓN ---
     try:
         modo = db.obtener_modo_verificacion()
     except Exception as exc:
@@ -98,7 +103,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             tareas_pv = db.listar_tareas_por_verificar()
             tareas_ab = db.listar_tareas_abiertas()
-            propuesta = llm.interpretar_correccion(msg.text, tareas_pv + tareas_ab)
+            propuesta = llm.interpretar_correccion(texto, tareas_pv + tareas_ab)
         except Exception as exc:
             logger.error("Error en interpretar_correccion: %s", exc)
             propuesta = {"correcciones": [], "interpretacion": "", "hay_cambios": False}
@@ -123,26 +128,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     telegram_message_id=msg.message_id,
                     chat_id=chat.id,
                     autor=autor,
-                    texto=msg.text,
-                    clasificacion={"modo": "verificacion_correccion", "propuesta": propuesta},
+                    texto=texto,
+                    clasificacion={"modo": "verificacion_correccion", "propuesta": propuesta, "origen": origen},
                 )
             except Exception as exc:
                 logger.error("Error al procesar corrección en modo verificación: %s", exc)
-            return  # No continuar al flujo normal
+            return
 
         logger.info("Modo verificación activo pero mensaje no es corrección; procesando normalmente.")
 
     # --- FLUJO NORMAL ---
     tareas_abiertas = db.listar_tareas_abiertas()
-    clasificacion = llm.classify(msg.text, tareas_abiertas)
-    logger.info("Clasificado como '%s' | %s", clasificacion["categoria"], clasificacion["razonamiento"])
+    clasificacion = llm.classify(texto, tareas_abiertas)
+    logger.info("Clasificado como '%s' | origen=%s | %s",
+                clasificacion["categoria"], origen, clasificacion["razonamiento"])
 
     db.insertar_mensaje_log(
         telegram_message_id=msg.message_id,
         chat_id=chat.id,
         autor=autor,
-        texto=msg.text,
-        clasificacion=clasificacion,
+        texto=texto,
+        clasificacion={**clasificacion, "origen": origen},
     )
 
     categoria = clasificacion["categoria"]
@@ -155,8 +161,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 autor=autor,
                 prioridad=clasificacion["prioridad"] or "media",
             )
-            logger.info("Tarea %d creada: '%s' (prioridad: %s)",
-                        tarea_id, clasificacion["titulo"], clasificacion["prioridad"] or "media")
+            logger.info("Tarea %d creada: '%s' (prioridad: %s, origen: %s)",
+                        tarea_id, clasificacion["titulo"], clasificacion["prioridad"] or "media", origen)
             reaccionar = True
         except Exception as exc:
             logger.error("Error al crear tarea: %s", exc)
@@ -193,6 +199,127 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except Exception as exc:
             logger.warning("No se pudo reaccionar al mensaje: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Handler principal — texto
+# ---------------------------------------------------------------------------
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None or msg.text is None:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    autor = user.username or user.full_name or str(user.id)
+
+    logger.info("Mensaje recibido | chat_id=%s | autor=%s | texto=%r", chat.id, autor, msg.text[:80])
+
+    await _run_pipeline(msg.text, "texto", msg, chat, autor, context)
+
+
+# ---------------------------------------------------------------------------
+# Handler de audio/voz — transcribe con Gemini, luego mismo pipeline que texto
+#
+# DEUDA TÉCNICA — privacidad/RGPD:
+# El audio pasa por Gemini (Google, tier gratuito). Hay DOS puntos de proceso
+# LLM que requieren migración cuando se exija un proveedor con DPA/RGPD:
+#   1. Texto → ya en Claude (Anthropic). Se migra cambiando LLM_PROVIDER.
+#   2. Audio → aún en Gemini. Se migra en llm.transcribe_audio(), NO aquí.
+# Cambiar solo LLM_PROVIDER no es suficiente. Ver también el comentario en llm.py.
+# ---------------------------------------------------------------------------
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    autor = user.username or user.full_name or str(user.id)
+
+    audio = msg.voice or msg.audio
+    if audio is None:
+        return
+
+    # Las notas de voz de Telegram son audio/ogg; los ficheros de audio pueden tener otro MIME.
+    mime_type = "audio/ogg"
+    if msg.audio and msg.audio.mime_type:
+        mime_type = msg.audio.mime_type
+
+    logger.info("Audio recibido | chat_id=%s | autor=%s | file_id=%s", chat.id, autor, audio.file_id)
+
+    if audio.file_size and audio.file_size > 5_000_000:
+        logger.info("Audio descartado por tamaño | autor=%s | file_size=%d", autor, audio.file_size)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=msg.message_id,
+                reaction=[ReactionTypeEmoji(emoji="👀")],
+            )
+        except Exception:
+            pass
+        try:
+            await msg.reply_text("Audio demasiado largo para procesar. Si hay una tarea, usa /nueva.")
+        except Exception:
+            pass
+        return
+
+    try:
+        tg_file = await context.bot.get_file(audio.file_id)
+        audio_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception as exc:
+        logger.error("Error al descargar audio: %s", exc)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=msg.message_id,
+                reaction=[ReactionTypeEmoji(emoji="👀")],
+            )
+        except Exception:
+            pass
+        return
+
+    texto = llm.transcribe_audio(audio_bytes, mime_type)
+
+    if not texto:
+        logger.warning("Transcripción vacía | autor=%s", autor)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=msg.message_id,
+                reaction=[ReactionTypeEmoji(emoji="👀")],
+            )
+        except Exception as exc:
+            logger.warning("No se pudo reaccionar al audio sin transcripción: %s", exc)
+        try:
+            await msg.reply_text("No pude entender el audio. Si hay una tarea, usa /nueva.")
+        except Exception as exc:
+            logger.warning("No se pudo avisar de audio inaudible: %s", exc)
+        return
+
+    logger.info("Audio transcrito | autor=%s | texto=%r", autor, texto[:80])
+    await _run_pipeline(texto, "audio", msg, chat, autor, context)
+
+
+# ---------------------------------------------------------------------------
+# Handler de fotos y vídeos — solo reacción 👀, sin clasificación
+# ---------------------------------------------------------------------------
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+    chat = update.effective_chat
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat.id,
+            message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji(emoji="👀")],
+        )
+    except Exception as exc:
+        logger.warning("No se pudo reaccionar a media: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +581,8 @@ def main() -> None:
     app.add_handler(CommandHandler("hecha", cmd_hecha))
     app.add_handler(CommandHandler("estado", cmd_estado))
 
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.add_handler(CallbackQueryHandler(handle_verif_callback, pattern="^verif:"))
