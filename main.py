@@ -434,12 +434,10 @@ async def job_resumen_apertura(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("[JOB apertura] Error: %s", exc)
 
 
-async def job_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Resumen de cierre — 17:00. Activa modo verificación si hay tareas por_verificar."""
-    if not es_dia_laborable():
-        return
+async def _ejecutar_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lógica de cierre compartida por job_resumen_cierre y cmd_forzar_cierre."""
     if GROUP_CHAT_ID is None:
-        logger.warning("[JOB cierre] GROUP_CHAT_ID no configurado.")
+        logger.warning("[CIERRE] GROUP_CHAT_ID no configurado.")
         return
     try:
         tareas_ab = db.listar_tareas_abiertas()
@@ -464,15 +462,22 @@ async def job_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "resumen_message_id": sent.message_id,
                 "propuesta_pendiente": None,
             })
-            logger.info("[JOB cierre] Modo verificación activado con %d tarea(s).", len(tareas_pv))
+            logger.info("[CIERRE] Modo verificación activado con %d tarea(s).", len(tareas_pv))
         else:
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID, text=texto + "\n\nTodas las tareas están en orden. Mañana más."
             )
-            logger.info("[JOB cierre] Resumen enviado sin modo verificación.")
+            logger.info("[CIERRE] Resumen enviado sin modo verificación.")
 
     except Exception as exc:
-        logger.error("[JOB cierre] Error: %s", exc)
+        logger.error("[CIERRE] Error: %s", exc)
+
+
+async def job_resumen_cierre(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resumen de cierre — 17:00. Solo días laborables; delega en _ejecutar_resumen_cierre."""
+    if not es_dia_laborable():
+        return
+    await _ejecutar_resumen_cierre(context)
 
 
 async def job_expiracion_verificacion(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -566,6 +571,19 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Error al actualizar la tarea.")
 
 
+async def cmd_forzar_cierre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fuerza el resumen de cierre manualmente (pruebas). Solo desde GROUP_CHAT_ID."""
+    if GROUP_CHAT_ID and update.effective_chat.id != GROUP_CHAT_ID:
+        return
+    if db.obtener_modo_verificacion() is not None:
+        await update.message.reply_text(
+            "⚠️ Ya hay un cierre abierto. Resuélvelo con los botones o espera a medianoche antes de forzar otro."
+        )
+        return
+    logger.info("[FORZAR_CIERRE] Disparado manualmente por %s", update.effective_user.username or update.effective_user.id)
+    await _ejecutar_resumen_cierre(context)
+
+
 # ---------------------------------------------------------------------------
 # Arranque
 # ---------------------------------------------------------------------------
@@ -580,6 +598,7 @@ def main() -> None:
     app.add_handler(CommandHandler("nueva", cmd_nueva))
     app.add_handler(CommandHandler("hecha", cmd_hecha))
     app.add_handler(CommandHandler("estado", cmd_estado))
+    app.add_handler(CommandHandler("forzar_cierre", cmd_forzar_cierre))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE, handle_media))
