@@ -20,6 +20,16 @@ config.py     Variables de entorno
 utils.py      es_dia_laborable(), ahora_madrid()
 ```
 
+### Jobs programados (`main.py`)
+
+| Job | Hora (Europe/Madrid) | Días |
+|---|---|---|
+| Resumen de apertura | 8:30 | Lunes a viernes |
+| Resumen de cierre | 17:00 | Lunes a viernes |
+| Expiración de verificación | 00:00 | Todos los días |
+
+> **⚠️ Convención de días en python-telegram-bot**: el parámetro `days` de `run_daily` usa `0 = domingo … 6 = sábado`, **no** la convención de `datetime.weekday()` (donde lunes = 0). Por eso lunes-viernes se expresa como `days=(1, 2, 3, 4, 5)`. Usar `(0, 1, 2, 3, 4)` deja **fuera el viernes** (se interpreta como domingo-jueves). `es_dia_laborable()` vuelve a filtrar con la convención de Python como red de seguridad.
+
 ### Proveedores LLM
 
 | Función | Proveedor | Cómo cambiar |

@@ -608,8 +608,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_corr_callback, pattern="^corr:"))
 
     jq = app.job_queue
-    jq.run_daily(job_resumen_apertura, time=time(8, 30, tzinfo=TZ), days=(0, 1, 2, 3, 4), name="apertura")
-    jq.run_daily(job_resumen_cierre, time=time(17, 0, tzinfo=TZ), days=(0, 1, 2, 3, 4), name="cierre")
+    # OJO: en python-telegram-bot, days usa 0=domingo … 6=sábado (NO la convención
+    # de datetime.weekday(), donde lunes=0). Lunes-viernes son (1, 2, 3, 4, 5).
+    # es_dia_laborable() vuelve a filtrar por seguridad usando la convención de Python.
+    jq.run_daily(job_resumen_apertura, time=time(8, 30, tzinfo=TZ), days=(1, 2, 3, 4, 5), name="apertura")
+    jq.run_daily(job_resumen_cierre, time=time(17, 0, tzinfo=TZ), days=(1, 2, 3, 4, 5), name="cierre")
     jq.run_daily(job_expiracion_verificacion, time=time(0, 0, tzinfo=TZ), name="expiracion_verificacion")
 
     logger.info("Bot arrancado con long-polling.")
